@@ -1,0 +1,129 @@
+name: build-veracity-graph
+on:
+  push:
+    paths:
+      - 'data/events.jsonl'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Build overview + per-app graphs
+        run: |
+          mkdir -p public/apps
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const path = 'data/events.jsonl';
+          const lines = fs.existsSync(path) ? fs.readFileSync(path,'utf8').trim().split('\n') : [];
+          const events = lines.filter(Boolean).map(l=>JSON.parse(l));
+
+          function buildGraph(subset){
+            let id=0, nodes=[], edges=[], perCase={};
+            for(const ev of subset){
+              const node = {
+                id: `${ev.case}#${++id}`, app: ev.app, case: ev.case,
+                status: ev.status || 'pending',
+                label: `${ev.type}: ${ev.text}`.slice(0,120),
+                sources: ev.sources || [], who: ev.who, ts: ev.ts
+              };
+              nodes.push(node);
+              (perCase[ev.case]??=[]).push(node);
+            }
+            for(const c in perCase){
+              const arr=perCase[c], is=(n,t)=> (n.label||'').startsWith(t+':');
+              const claims=arr.filter(n=>is(n,'claim'));
+              const counters=arr.filter(n=>is(n,'counter'));
+              const decisions=arr.filter(n=>is(n,'decision'));
+              for(const cl of claims){
+                for(const ct of counters) edges.push({from:cl.id,to:ct.id,kind:'adversary'});
+                for(const dc of decisions) edges.push({from:cl.id,to:dc.id,kind:'resolves'});
+              }
+            }
+            return {nodes,edges};
+          }
+
+          const esc = s => (''+s).replace(/[&<>]/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;' }[m]));
+          const statusClass = s => s==='verified'?'g' : (s==='flagged'?'r':'y');
+          const viewerHTML = (title) => `<!doctype html>
+            <meta charset="utf-8"><title>${esc(title)}</title>
+            <style>
+              body{font:16px system-ui;margin:20px;background:#0b0b0b;color:#eee}
+              .legend span{display:inline-block;margin-right:12px}
+              .g{background:#185a37;padding:3px 8px;border-radius:6px}
+              .y{background:#66520b;padding:3px 8px;border-radius:6px}
+              .r{background:#6b2323;padding:3px 8px;border-radius:6px}
+              .card{border:1px solid #333;border-radius:10px;padding:10px;margin:8px 0;cursor:pointer}
+              .muted{color:#aaa}
+              #detail{position:fixed;right:20px;top:20px;max-width:420px;background:#111;border:1px solid #333;padding:12px;border-radius:10px}
+              a{color:#9cc5ff}
+            </style>
+            <h1>${esc(title)}</h1>
+            <div class="legend">
+              <span class="g">verified</span>
+              <span class="y">pending</span>
+              <span class="r">flagged</span>
+            </div>
+            <div id="list"></div>
+            <div id="detail" class="muted">Click a node to see details.</div>
+            <script>
+              fetch('graph.json').then(r=>r.json()).then(data=>{
+                const list=document.getElementById('list');
+                const detail=document.getElementById('detail');
+                const cls = ${statusClass.toString()};
+                const esc = ${esc.toString()};
+                data.nodes.forEach(n=>{
+                  const d=document.createElement('div'); d.className='card';
+                  d.innerHTML = '<b>['+esc(n.case)+']</b> ' +
+                    '<span class="'+cls(n.status)+'">'+esc(n.status)+'</span>' +
+                    '<br>'+esc(n.label) +
+                    (n.sources?.length?('<br><small>sources: '+n.sources.map(esc).join(', ')+'</small>'):'') ;
+                  d.onclick=()=>{ detail.innerHTML =
+                    '<b>Case:</b> '+esc(n.case)+'<br>' +
+                    '<b>App:</b> '+esc(n.app||'')+'<br>' +
+                    '<b>Status:</b> '+esc(n.status)+'<br>' +
+                    '<b>Label:</b> '+esc(n.label)+'<br>' +
+                    (n.sources?.length?('<b>Sources:</b> '+n.sources.map(esc).join(', ')+'<br>'):'') +
+                    '<span class="muted">ID '+esc(n.id)+' · '+esc(n.ts||'')+'</span>';
+                  };
+                  list.appendChild(d);
+                });
+              });
+            </script>`;
+
+          // Overview
+          const apps = [...new Set(events.map(e=>e.app||'Unknown'))].sort();
+          const links = apps.map(a=>`<li><a href="./apps/${esc(a)}/index.html">${esc(a)}</a></li>`).join('');
+          fs.writeFileSync('public/index.html', `<!doctype html>
+            <meta charset="utf-8"><title>Veracity Graph — Overview</title>
+            <style>body{font:16px system-ui;margin:20px;background:#0b0b0b;color:#eee} a{color:#9cc5ff}</style>
+            <h1>Veracity Graph — Overview</h1>
+            <p>Apps:</p><ul>${links}</ul>
+            <p><a href="./index-all.html">All events (combined list)</a></p>`);
+
+          // All-events
+          const all = buildGraph(events);
+          fs.writeFileSync('public/graph.json', JSON.stringify(all,null,2));
+          fs.writeFileSync('public/index-all.html', viewerHTML('All Events'));
+
+          // Per-app
+          for (const app of apps) {
+            const sub = events.filter(e => (e.app||'Unknown')===app);
+            const g = buildGraph(sub);
+            const dir = `public/apps/${app}`;
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(`${dir}/graph.json`, JSON.stringify(g,null,2));
+            fs.writeFileSync(`${dir}/index.html`, viewerHTML(`${app} — Veracity Graph`));
+          }
+          NODE
+      - name: Commit public artifacts
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add public/
+          git commit -m "Build per-app veracity graphs" || echo "No changes"
+          git push
